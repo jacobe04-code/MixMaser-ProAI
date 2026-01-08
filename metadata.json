@@ -1,0 +1,7 @@
+{
+  "name": "Copy of MixMaster Pro AI",
+  "description": "A high-end, AI-powered DJ mixing application featuring dual decks, real-time stem separation simulation, harmonic mixing recommendations, and an AI DJ host powered by Gemini.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
