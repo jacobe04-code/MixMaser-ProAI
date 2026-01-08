@@ -15,7 +15,7 @@ class AudioEngine {
 
   private constructor() {
     this.masterLimiter = new Tone.Limiter(-1).toDestination();
-    this.masterCompressor = new Tone.Compressor({ ratio: 3, threshold: -24, release: 0.25, attack: 0.003 });
+    this.masterCompressor = new Tone.Compressor({ ratio: 4, threshold: -24, release: 0.3, attack: 0.01 });
     this.masterAnalyser = new Tone.Analyser("fft", 256);
     this.masterRecorder = new Tone.Recorder();
     
@@ -47,8 +47,9 @@ class AudioEngine {
     await Tone.start();
   }
 
-  public duckMusic(duck: boolean, duration: number = 0.5) {
-    const target = duck ? 0.2 : 1.0;
+  public duckMusic(duck: boolean, duration: number = 0.8) {
+    // Pro-broadcast ducking: 0.8s ramp for a smooth fade behind the host voice
+    const target = duck ? 0.15 : 1.0;
     this.musicDuckingNode.gain.rampTo(target, duration);
   }
 

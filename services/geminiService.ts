@@ -2,30 +2,26 @@
 import { GoogleGenAI, Modality, GenerateContentResponse, Type, FunctionDeclaration } from "@google/genai";
 import { CAMELOT_MAP } from "../constants";
 
-// Helper to wait for a specific duration
 const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Robust calling utility with exponential backoff for 429 errors
 async function callGeminiWithRetry<T>(fn: (ai: GoogleGenAI) => Promise<T>, retries = 3): Promise<T> {
   let delay = 1000;
-  // Always create a fresh instance to use the latest injected API key
+  // Initialize GoogleGenAI right before making the call to ensure up-to-date API key
   const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
-  
   for (let i = 0; i < retries; i++) {
     try {
       return await fn(ai);
     } catch (error: any) {
       const isRateLimit = error.message?.includes('429') || error.status === 429;
       if (isRateLimit && i < retries - 1) {
-        console.warn(`Gemini Rate Limit (429) hit. Retrying in ${delay}ms...`);
         await sleep(delay);
-        delay *= 2; // Exponential backoff
+        delay *= 2;
         continue;
       }
       throw error;
     }
   }
-  throw new Error("Maximum retries exceeded for Gemini API");
+  throw new Error("Maximum retries exceeded");
 }
 
 export const aiDJFunctionDeclarations: FunctionDeclaration[] = [
@@ -91,17 +87,24 @@ export const aiDJFunctionDeclarations: FunctionDeclaration[] = [
 
 export const interactWithAIDJ = async (message: string, history: any[], context: any) => {
   return callGeminiWithRetry(async (ai) => {
-    const limitedHistory = history.slice(-8); // Slightly tighter history for stability
+    const limitedHistory = history.slice(-6); 
     const contents = [...limitedHistory, { role: 'user', parts: [{ text: message }] }];
     
     const response = await ai.models.generateContent({
       model: 'gemini-3-flash-preview',
       contents: contents,
       config: {
-        systemInstruction: `You are 'JD', the ultimate late-night FM host and pro club DJ assistant. 
-        Current Studio: ${JSON.stringify(context)}.
-        Rules: Smooth FM host voice, audio nerd technicality, proactive control. Phase 1: Onboarding Q&A. Phase 2: Autonomous mixing. 
-        Response: Text for TTS + Functions.`,
+        systemInstruction: `You are 'JD', a world-class AI DJ host with a deep, smooth, charismatic late-night FM personality.
+        
+        TONE RULES:
+        1. NEVER use the phrase "Loud and clear" or generic affirmations like "Roger that."
+        2. BE TECHNICAL: Mention things like 'transient response', 'spectral density', 'harmonic saturation', or 'phase correlation'.
+        3. BE COOL: You are in the booth. You are the tastemaker.
+        4. BREVITY: Keep spoken responses under 20 words for high impact.
+        
+        CONTEXT: ${JSON.stringify(context)}.
+        
+        GOAL: If the user is setting a vibe, use 'vibe_shift'. If they want you to mix, use 'set_auto_pilot'. Always check deck states before suggesting a track.`,
         tools: [{ functionDeclarations: aiDJFunctionDeclarations }],
       },
     });
@@ -114,11 +117,12 @@ export const generateJDVoice = async (text: string, voiceName: string): Promise<
     return await callGeminiWithRetry(async (ai) => {
       const response = await ai.models.generateContent({
         model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text: `Act as JD, the smooth FM host. Speak this naturally: ${text}` }] }],
+        contents: [{ parts: [{ text: text }] }],
         config: {
           responseModalities: [Modality.AUDIO],
           speechConfig: {
             voiceConfig: {
+              // voiceName must be one of the prebuilt voices
               prebuiltVoiceConfig: { voiceName: voiceName || 'Charon' },
             },
           },
@@ -127,66 +131,72 @@ export const generateJDVoice = async (text: string, voiceName: string): Promise<
       return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || null;
     });
   } catch (error) {
-    console.error("JD Voice Gen Error:", error);
     return null;
   }
 };
 
-export const generateDJIntro = async (trackA: string, trackB: string, voiceName: string): Promise<string | null> => {
-  try {
-    return await callGeminiWithRetry(async (ai) => {
-      const textResponse = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: `Unique, smooth DJ intro for "${trackA}" and "${trackB}". Max 15 words.`,
-      });
-      const introText = textResponse.text || "Synchronizing frequencies.";
-      return await generateJDVoice(introText, voiceName);
-    });
-  } catch (error) {
-    return null;
-  }
-};
-
-export const getAssistantTip = async (context: any): Promise<string> => {
-  try {
-    return await callGeminiWithRetry(async (ai) => {
-      const response = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: `One-sentence technical audio tip for state: ${JSON.stringify(context)}. Max 12 words.`,
-      });
-      return response.text?.trim() || "Watch those harmonic overlaps.";
-    });
-  } catch (error) {
-    return "Monitor your gain stages carefully.";
-  }
-};
-
-export const generateMashupNames = async (trackA: string, trackB: string): Promise<string[]> => {
-  try {
-    return await callGeminiWithRetry(async (ai) => {
-      const response: GenerateContentResponse = await ai.models.generateContent({
-        model: 'gemini-3-flash-preview',
-        contents: `3 unique mashup names for "${trackA}" and "${trackB}".`,
-      });
-      const text = response.text || "";
-      return text.split(',').map(s => s.trim()).filter(s => s.length > 0).slice(0, 3);
-    });
-  } catch (error) {
-    return [`${trackA} vs ${trackB}`, "Electric Mashup", "Midnight Mix"];
-  }
-};
-
-export const generateMagicMatch = async (trackName: string, artistName: string, currentKey: string, currentBpm: number, targetDeck: string): Promise<string> => {
+export const generateMagicMatch = async (trackName: string, artistName: string, currentKey: string, currentBpm: number, targetDeck: string, vibePreference?: string): Promise<string> => {
   try {
     return await callGeminiWithRetry(async (ai) => {
       const camelot = CAMELOT_MAP[currentKey] || '8B';
+      const prompt = `Analysing acoustic fingerprint for "${trackName}" by "${artistName}" (Key: ${camelot}, BPM: ${currentBpm}). 
+      ${vibePreference ? `The current session vibe is: "${vibePreference}".` : ""}
+      Find a harmonically compatible match for Deck ${targetDeck} that fits the requested vibe. 
+      Format strictly as: Artist - Title.`;
+
       const response: GenerateContentResponse = await ai.models.generateContent({
         model: 'gemini-3-flash-preview',
-        contents: `Harmonic match for "${trackName}" (Key: ${camelot}, BPM: ${currentBpm}) on Deck ${targetDeck}. Artist - Title only.`,
+        contents: prompt,
       });
       return response.text?.trim() || "Daft Punk - One More Time";
     });
   } catch (error) {
     return "Daft Punk - One More Time";
   }
+};
+
+// Fix: Added generateMashupNames for AI DJ identifying track combinations
+export const generateMashupNames = async (trackA: string, trackB: string): Promise<string[]> => {
+  return callGeminiWithRetry(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: `Generate 3 creative mashup names for a mix of "${trackA}" and "${trackB}". Return as a JSON array of strings.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING }
+        }
+      }
+    });
+    try {
+      const text = response.text || "[]";
+      return JSON.parse(text);
+    } catch (e) {
+      return ["Sonic Merge", "Wave Blender", "Beat Fusion"];
+    }
+  });
+};
+
+// Fix: Added generateDJIntro to create spoken intros for the performance
+export const generateDJIntro = async (trackA: string, trackB: string, voiceName: string): Promise<string | null> => {
+  const introText = await callGeminiWithRetry(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: `Write a very short (max 12 words), charismatic late-night radio DJ intro for a mashup of "${trackA}" and "${trackB}".`,
+    });
+    return response.text || "Mixing it up with some fresh energy in the booth.";
+  });
+  return generateJDVoice(introText, voiceName);
+};
+
+// Fix: Added getAssistantTip for live mixing guidance
+export const getAssistantTip = async (context: any): Promise<string> => {
+  return callGeminiWithRetry(async (ai) => {
+    const response = await ai.models.generateContent({
+      model: 'gemini-3-flash-preview',
+      contents: `Based on this DJ state: ${JSON.stringify(context)}, give a very brief technical tip (max 8 words) to improve the mix.`,
+    });
+    return response.text?.trim() || "Monitor spectral density for peak clarity.";
+  });
 };

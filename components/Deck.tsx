@@ -1,5 +1,5 @@
 
-import React, { useState, useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
+import React, { useState, useEffect, useRef, useImperativeHandle, forwardRef, useCallback } from 'react';
 import * as Tone from 'tone';
 import { DeckId, Track } from '../types';
 import { Icon, KEYS, CAMELOT_MAP } from '../constants';
@@ -40,12 +40,48 @@ const Deck = forwardRef<DeckHandle, DeckProps>(({ id, track, masterBpm, masterKe
   const pitchRef = useRef<Tone.PitchShift | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rafRef = useRef<number>(0);
+  const pendingPlayRef = useRef(false);
   
   const playbackRef = useRef({
     isPlaying: false,
     startTime: 0,
     offset: 0
   });
+
+  const handleStop = useCallback(() => {
+    if (player) player.stop();
+    playbackRef.current.isPlaying = false;
+    playbackRef.current.offset = 0;
+    setIsPlaying(false);
+    setCurrentTime(0);
+    pendingPlayRef.current = false;
+  }, [player]);
+
+  const handlePlay = useCallback(async (offset = playbackRef.current.offset) => {
+    if (!player) return;
+    
+    // If not loaded yet, queue it up for later
+    if (!loaded || !player.buffer.loaded) {
+      pendingPlayRef.current = true;
+      return;
+    }
+
+    if (playbackRef.current.isPlaying) return;
+
+    await audioEngine.start();
+    const startOffset = Math.max(0, Math.min(offset, duration));
+    
+    try {
+      player.start(0, startOffset);
+      playbackRef.current.isPlaying = true;
+      playbackRef.current.startTime = player.now();
+      playbackRef.current.offset = startOffset;
+      setIsPlaying(true);
+      pendingPlayRef.current = false;
+    } catch (err) {
+      console.error(`Deck ${id} failed to play:`, err);
+    }
+  }, [player, loaded, duration, id]);
 
   useImperativeHandle(ref, () => ({
     play: () => handlePlay(),
@@ -62,18 +98,18 @@ const Deck = forwardRef<DeckHandle, DeckProps>(({ id, track, masterBpm, masterKe
   }));
 
   useEffect(() => {
-    if (!track) return;
+    if (!track || !track.url) return;
+    
+    let isMounted = true;
     const init = async () => {
       setLoaded(false);
       handleStop();
-      if (player) {
-        player.dispose();
-      }
       
       const newPlayer = new Tone.Player({
         url: track.url,
-        loop: true, // Enable continuous looping
+        loop: true,
         onload: () => {
+          if (!isMounted) return;
           setLoaded(true);
           setDuration(newPlayer.buffer.duration);
           const detectedBpm = Math.floor(Math.random() * 20 + 115);
@@ -82,6 +118,14 @@ const Deck = forwardRef<DeckHandle, DeckProps>(({ id, track, masterBpm, masterKe
           setOriginalKey(detectedKey);
           onReportBpm(detectedBpm);
           drawWaveform(newPlayer.buffer);
+
+          // If a play request came in while loading, fulfill it now
+          if (pendingPlayRef.current) {
+            handlePlay();
+          }
+        },
+        onerror: (e) => {
+          console.error("Tone Player Error:", e);
         },
         onstop: () => {
           if (newPlayer.state === 'stopped' && playbackRef.current.isPlaying) {
@@ -108,9 +152,10 @@ const Deck = forwardRef<DeckHandle, DeckProps>(({ id, track, masterBpm, masterKe
     init();
 
     return () => {
+      isMounted = false;
       if (player) player.dispose();
     };
-  }, [track?.id]); 
+  }, [track?.id, track?.url, id]); // Added track.url to sensitivity
 
   // Synchronize playback rate and pitch shift
   useEffect(() => {
@@ -121,15 +166,14 @@ const Deck = forwardRef<DeckHandle, DeckProps>(({ id, track, masterBpm, masterKe
 
     if (syncEnabled) {
       targetRate = masterBpm / originalBpm;
-      
       let keyDiff = KEYS.indexOf(masterKey) - KEYS.indexOf(originalKey);
       if (keyDiff > 6) keyDiff -= 12;
       if (keyDiff < -6) keyDiff += 12;
       targetPitch = keyDiff;
     }
 
-    player.playbackRate = targetRate;
-    if (pitchRef.current) {
+    if (player.playbackRate !== targetRate) player.playbackRate = targetRate;
+    if (pitchRef.current && pitchRef.current.pitch !== targetPitch) {
       pitchRef.current.pitch = targetPitch;
     }
   }, [masterBpm, masterKey, syncEnabled, loaded, originalBpm, originalKey, playbackRate, pitchShift, player]);
@@ -137,25 +181,6 @@ const Deck = forwardRef<DeckHandle, DeckProps>(({ id, track, masterBpm, masterKe
   useEffect(() => {
     if (player) player.volume.value = volume;
   }, [volume, player]);
-
-  const handlePlay = async (offset = playbackRef.current.offset) => {
-    if (!player || !loaded || playbackRef.current.isPlaying) return;
-    await audioEngine.start();
-    const startOffset = Math.max(0, Math.min(offset, duration));
-    player.start(0, startOffset);
-    playbackRef.current.isPlaying = true;
-    playbackRef.current.startTime = player.now();
-    playbackRef.current.offset = startOffset;
-    setIsPlaying(true);
-  };
-
-  const handleStop = () => {
-    if (player) player.stop();
-    playbackRef.current.isPlaying = false;
-    playbackRef.current.offset = 0;
-    setIsPlaying(false);
-    setCurrentTime(0);
-  };
 
   const handleSeek = (e: React.MouseEvent<HTMLDivElement>) => {
     if (!loaded || !player) return;
@@ -245,13 +270,18 @@ const Deck = forwardRef<DeckHandle, DeckProps>(({ id, track, masterBpm, masterKe
         <div className="h-28 bg-black/60 rounded-2xl mb-4 overflow-hidden relative border border-white/10 cursor-crosshair" onClick={handleSeek}>
           <canvas ref={canvasRef} width="400" height="112" className="w-full h-full opacity-40 group-hover:opacity-70 transition-opacity" />
           {loaded && <div className="absolute top-0 bottom-0 w-0.5 bg-white shadow-[0_0_15px_white] z-20" style={{ left: `${duration ? (currentTime / duration) * 100 : 0}%` }} />}
+          {!loaded && track && (
+             <div className="absolute inset-0 flex items-center justify-center bg-black/40">
+                <div className="w-6 h-6 border-2 border-white/20 border-t-white rounded-full animate-spin" />
+             </div>
+          )}
         </div>
 
         <div className="flex gap-3 mb-6">
-          <button onClick={() => handlePlay()} disabled={!loaded || isPlaying} className={`flex-1 py-4 rounded-2xl font-black flex items-center justify-center gap-2 transition-all ${isPlaying ? 'bg-green-500 text-white' : 'bg-white/10 hover:bg-white/20 text-white border border-white/10'}`}>
-            <Icon name="play" size={20} /> PLAY
+          <button onClick={() => handlePlay()} disabled={isPlaying} className={`flex-1 py-4 rounded-2xl font-black flex items-center justify-center gap-2 transition-all ${isPlaying ? 'bg-green-500 text-white' : 'bg-white/10 hover:bg-white/20 text-white border border-white/10'}`}>
+            <Icon name="play" size={20} /> {isPlaying ? 'PLAYING' : 'PLAY'}
           </button>
-          <button onClick={handleStop} disabled={!loaded} className="flex-1 py-4 bg-white/10 hover:bg-red-500 hover:text-white border border-white/10 text-white/70 rounded-2xl font-black flex items-center justify-center gap-2 transition-all">
+          <button onClick={handleStop} disabled={!track} className="flex-1 py-4 bg-white/10 hover:bg-red-500 hover:text-white border border-white/10 text-white/70 rounded-2xl font-black flex items-center justify-center gap-2 transition-all">
             <Icon name="stop" size={20} /> STOP
           </button>
         </div>
